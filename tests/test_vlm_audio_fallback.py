@@ -1,4 +1,4 @@
-"""Tests for the audio_tower fallback in VLM loading.
+"""Tests for the audio_tower fallback and key-remap logic in VLM loading.
 
 Background: oQ-quantized multimodal Gemma 4 checkpoints sometimes ship with
 `audio_config` in `config.json` but no `audio_tower.*` weights in the
@@ -8,6 +8,11 @@ on `audio_config`. The `_strip_audio_config_if_orphaned` context manager
 swaps `mlx_vlm.utils.load_config` for the duration of the call so that the
 config is read with `audio_config = None` when audio weights are absent,
 letting the model load without audio support.
+
+Additionally, MLX-format checkpoints skip ``Model.sanitize``, so key remaps
+that sanitize normally applies must be re-applied during ``load_weights``.
+For ``gemma4_unified``, this means stripping the outer ``model.`` prefix and
+inserting ``model.`` inside ``language_model.*`` sub-paths.
 """
 
 import json
@@ -20,7 +25,11 @@ import mlx_vlm.utils as _vu
 
 from omlx.engine.vlm import (
     _AUDIO_CONFIG_KEYS,
+    _NESTED_VIS_PREFIX,
+    _VISION_TOWER_PREFIX,
+    _apply_gemma4_unified_key_remap,
     _has_audio_weights,
+    _remap_nested_visual_on_load,
     _strip_audio_config_if_orphaned,
 )
 
@@ -197,3 +206,372 @@ class TestStripAudioConfigIfOrphaned:
         # cfg returned unchanged — audio_config still a dict, not None.
         assert cfg["audio_config"] == {"hidden_size": 99}
         assert cfg["audio_token_id"] == 12345
+
+
+# ---------------------------------------------------------------------------
+# _has_audio_weights — model.-prefixed keys (gemma4_unified MLX checkpoints)
+# ---------------------------------------------------------------------------
+
+
+class TestHasAudioWeightsModelPrefix:
+    """MLX-format gemma4_unified checkpoints store audio weights as
+    ``model.embed_audio.*`` (pre-sanitize HF key format).  The detector must
+    recognise this prefix so audio_config is not incorrectly stripped."""
+
+    def _write_safetensors(self, path: Path, keys: list) -> None:
+        from safetensors.numpy import save_file
+        import numpy as np
+        save_file({k: np.zeros((1,), dtype=np.float32) for k in keys}, str(path))
+
+    def test_detects_model_embed_audio_prefix(self, tmp_path: Path):
+        d = tmp_path / "m"
+        d.mkdir()
+        self._write_safetensors(
+            d / "model.safetensors",
+            ["model.embed_audio.embedding_projection.weight",
+             "model.language_model.layers.0.self_attn.q_proj.weight"],
+        )
+        assert _has_audio_weights(d) is True
+
+    def test_detects_model_audio_tower_prefix(self, tmp_path: Path):
+        d = tmp_path / "m2"
+        d.mkdir()
+        self._write_safetensors(
+            d / "model.safetensors",
+            ["model.audio_tower.layers.0.weight"],
+        )
+        assert _has_audio_weights(d) is True
+
+    def test_no_false_positive_for_non_audio_model_prefix(self, tmp_path: Path):
+        d = tmp_path / "m3"
+        d.mkdir()
+        self._write_safetensors(
+            d / "model.safetensors",
+            ["model.language_model.layers.0.self_attn.q_proj.weight",
+             "model.embed_vision.embedding_projection.weight"],
+        )
+        assert _has_audio_weights(d) is False
+
+
+# ---------------------------------------------------------------------------
+# _apply_gemma4_unified_key_remap — unit tests for the key transform helper
+# ---------------------------------------------------------------------------
+
+
+class TestApplyGemma4UnifiedKeyRemap:
+    """The helper reproduces what ``gemma4_unified.Model.sanitize`` does for
+    each key: strip outer ``model.`` prefix and insert ``model.`` inside
+    language_model sub-paths that lack it."""
+
+    def test_language_model_layer_key(self):
+        k = "model.language_model.layers.0.self_attn.q_proj.weight"
+        assert _apply_gemma4_unified_key_remap(k) == (
+            "language_model.model.layers.0.self_attn.q_proj.weight"
+        )
+
+    def test_embed_tokens_key(self):
+        k = "model.language_model.embed_tokens.weight"
+        assert _apply_gemma4_unified_key_remap(k) == "language_model.model.embed_tokens.weight"
+
+    def test_embed_audio_key(self):
+        k = "model.embed_audio.embedding_projection.weight"
+        assert _apply_gemma4_unified_key_remap(k) == "embed_audio.embedding_projection.weight"
+
+    def test_embed_vision_key(self):
+        k = "model.embed_vision.embedding_projection.weight"
+        assert _apply_gemma4_unified_key_remap(k) == "embed_vision.embedding_projection.weight"
+
+    def test_already_sanitized_language_model_key_unchanged(self):
+        # Keys that already have "language_model.model." must not be double-remapped.
+        k = "language_model.model.layers.0.self_attn.q_proj.weight"
+        assert _apply_gemma4_unified_key_remap(k) == k
+
+    def test_already_sanitized_embed_key_unchanged(self):
+        k = "embed_audio.embedding_projection.weight"
+        assert _apply_gemma4_unified_key_remap(k) == k
+
+    def test_key_without_model_prefix_unchanged(self):
+        k = "lm_head.weight"
+        assert _apply_gemma4_unified_key_remap(k) == k
+
+
+# ---------------------------------------------------------------------------
+# _remap_nested_visual_on_load — integration: context manager applies remap
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# _strip_audio_config_if_orphaned — gemma4_unified quantization key remap
+# ---------------------------------------------------------------------------
+
+
+class TestStripAudioConfigQuantKeyRemap:
+    """Per-layer quantization dict keys use HF format (``model.language_model.*``)
+    in oQ4 checkpoints.  nn.quantize's class_predicate receives model-tree paths
+    (``language_model.model.*``), so the keys must be remapped before the config
+    reaches load_model for gemma4_unified."""
+
+    def _make_dir(self, tmp_path, quant_dict, model_type="gemma4_unified"):
+        d = tmp_path / "gu"
+        d.mkdir()
+        cfg = {
+            "model_type": model_type,
+            "quantization": dict(quant_dict),
+            "quantization_config": dict(quant_dict),
+        }
+        (d / "config.json").write_text(json.dumps(cfg))
+        from safetensors.numpy import save_file
+        import numpy as np
+        save_file({"k": np.zeros((1,), dtype=np.float32)}, str(d / "model.safetensors"))
+        return d
+
+    def test_per_layer_keys_remapped_in_quantization(self, tmp_path):
+        raw_quant = {
+            "group_size": 64,
+            "bits": 4,
+            "mode": "affine",
+            "model.language_model.layers.0.mlp.down_proj": {
+                "bits": 6, "group_size": 64, "mode": "affine",
+            },
+            "model.language_model.layers.0.self_attn.q_proj": {
+                "bits": 5, "group_size": 64, "mode": "affine",
+            },
+            "model.embed_vision.embedding_projection": {
+                "bits": 4, "group_size": 64, "mode": "affine",
+            },
+        }
+        d = self._make_dir(tmp_path, raw_quant)
+        with _strip_audio_config_if_orphaned(d):
+            cfg = _vu.load_config(d)
+        quant = cfg["quantization"]
+        # HF-format keys must be replaced by model-tree paths.
+        assert "model.language_model.layers.0.mlp.down_proj" not in quant
+        assert "model.language_model.layers.0.self_attn.q_proj" not in quant
+        assert "model.embed_vision.embedding_projection" not in quant
+        assert "language_model.model.layers.0.mlp.down_proj" in quant
+        assert quant["language_model.model.layers.0.mlp.down_proj"]["bits"] == 6
+        assert "language_model.model.layers.0.self_attn.q_proj" in quant
+        assert quant["language_model.model.layers.0.self_attn.q_proj"]["bits"] == 5
+        assert "embed_vision.embedding_projection" in quant
+        # Scalar top-level keys (group_size, bits, mode) are preserved.
+        assert quant["group_size"] == 64
+        assert quant["bits"] == 4
+
+    def test_per_layer_keys_remapped_in_quantization_config(self, tmp_path):
+        raw_quant = {
+            "group_size": 64,
+            "bits": 4,
+            "model.language_model.layers.1.mlp.gate_proj": {
+                "bits": 6, "group_size": 64, "mode": "affine",
+            },
+        }
+        d = self._make_dir(tmp_path, raw_quant)
+        with _strip_audio_config_if_orphaned(d):
+            cfg = _vu.load_config(d)
+        qc = cfg["quantization_config"]
+        assert "model.language_model.layers.1.mlp.gate_proj" not in qc
+        assert "language_model.model.layers.1.mlp.gate_proj" in qc
+
+    def test_scalar_values_not_remapped(self, tmp_path):
+        raw_quant = {"group_size": 64, "bits": 4, "mode": "affine"}
+        d = self._make_dir(tmp_path, raw_quant)
+        with _strip_audio_config_if_orphaned(d):
+            cfg = _vu.load_config(d)
+        assert cfg["quantization"]["group_size"] == 64
+        assert cfg["quantization"]["bits"] == 4
+
+    def test_non_gemma4_unified_keys_not_remapped(self, tmp_path):
+        """Other model types (e.g. gemma4) must not have their quant keys touched."""
+        raw_quant = {
+            "group_size": 64,
+            "bits": 4,
+            "model.language_model.layers.0.mlp.down_proj": {
+                "bits": 6, "group_size": 64,
+            },
+        }
+        d = self._make_dir(tmp_path, raw_quant, model_type="gemma4")
+        with _strip_audio_config_if_orphaned(d):
+            cfg = _vu.load_config(d)
+        quant = cfg["quantization"]
+        assert "model.language_model.layers.0.mlp.down_proj" in quant
+        assert "language_model.model.layers.0.mlp.down_proj" not in quant
+
+
+class TestRemapNestedVisualOnLoad:
+    """Integration tests for the context manager.  We install a fake
+    ``_vu.load_model`` (as the "original") and verify that calling the patched
+    version routes weight keys through the right transforms."""
+
+    def _make_model_dir(self, tmp_path: Path, model_type: str) -> Path:
+        d = tmp_path / model_type
+        d.mkdir()
+        (d / "config.json").write_text(json.dumps({"model_type": model_type}))
+        return d
+
+    def _remap_via_context(
+        self, model_dir: Path, raw_keys: list[str], monkeypatch
+    ) -> list[str]:
+        """Run raw_keys through the context manager's load_weights intercept
+        and return the keys that reach the bottom-level load_weights call."""
+        import mlx_vlm.utils as _vu2
+        import mlx.nn as _nn
+
+        received: list[tuple] = []
+
+        # Bottom-level tracker — captures whatever the context manager passes
+        # after remapping.
+        orig_lw = _nn.Module.load_weights
+
+        def tracking_lw(self, items, *args, **kw):
+            if not isinstance(items, str):
+                received.extend(items)
+            return orig_lw(self, items if isinstance(items, str) else [], *args, **kw)
+
+        # Fake "original" load_model that just calls load_weights with raw_keys.
+        # _remap_nested_visual_on_load saves this as its "original" and wraps it.
+        def fake_load_model(model_path, lazy=False, **kwargs):
+            class _M(_nn.Module):
+                pass
+            m = _M()
+            m.load_weights([(k, None) for k in raw_keys], strict=False)
+            return m, None
+
+        monkeypatch.setattr(_vu2, "load_model", fake_load_model)
+        monkeypatch.setattr(_nn.Module, "load_weights", tracking_lw)
+
+        with _remap_nested_visual_on_load(model_dir):
+            _vu2.load_model(str(model_dir))
+
+        return [k for k, _ in received]
+
+    def test_gemma4_unified_remap_applied(self, tmp_path: Path, monkeypatch):
+        model_dir = self._make_model_dir(tmp_path, "gemma4_unified")
+        raw_keys = [
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.embed_audio.embedding_projection.weight",
+            "model.embed_vision.embedding_projection.weight",
+        ]
+        result = self._remap_via_context(model_dir, raw_keys, monkeypatch)
+        assert "language_model.model.layers.0.self_attn.q_proj.weight" in result
+        assert "embed_audio.embedding_projection.weight" in result
+        assert "embed_vision.embedding_projection.weight" in result
+        assert not any(k.startswith("model.") for k in result)
+
+    def test_gemma4_unified_already_sanitized_keys_unchanged(self, tmp_path, monkeypatch):
+        model_dir = self._make_model_dir(tmp_path, "gemma4_unified")
+        raw_keys = [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "embed_audio.embedding_projection.weight",
+        ]
+        result = self._remap_via_context(model_dir, raw_keys, monkeypatch)
+        assert result == raw_keys
+
+    def test_non_gemma4_model_prefix_keys_untouched(self, tmp_path, monkeypatch):
+        model_dir = self._make_model_dir(tmp_path, "qwen2_vl")
+        raw_keys = ["model.language_model.layers.0.weight"]
+        result = self._remap_via_context(model_dir, raw_keys, monkeypatch)
+        assert result == raw_keys
+
+    def test_nested_vis_remap_still_fires_for_non_gemma4(self, tmp_path, monkeypatch):
+        model_dir = self._make_model_dir(tmp_path, "qwen2_vl")
+        raw_keys = [
+            f"{_NESTED_VIS_PREFIX}layer.0.weight",
+            "language_model.model.layers.0.weight",
+        ]
+        result = self._remap_via_context(model_dir, raw_keys, monkeypatch)
+        assert f"{_VISION_TOWER_PREFIX}layer.0.weight" in result
+        assert "language_model.model.layers.0.weight" in result
+
+    # ------------------------------------------------------------------
+    # _load_safetensors pre-remap (fixes nn.quantize class_predicate for
+    # MLX-format oQ4 gemma4_unified checkpoints)
+    # ------------------------------------------------------------------
+
+    def test_gemma4_unified_load_safetensors_pre_remaps(self, tmp_path, monkeypatch):
+        """Within _remap_nested_visual_on_load for gemma4_unified, calls to
+        _vu._load_safetensors return remapped keys so nn.quantize's
+        class_predicate (``f"{p}.scales" in weights``) works correctly."""
+        import mlx_vlm.utils as _vu2
+
+        model_dir = self._make_model_dir(tmp_path, "gemma4_unified")
+        captured: list[dict] = []
+
+        def fake_load_st(path):
+            return {
+                "model.language_model.layers.0.mlp.down_proj.scales": None,
+                "model.embed_audio.embedding_projection.scales": None,
+                "model.language_model.model.visual.0.weight": None,
+            }
+
+        def fake_load_model(model_path, lazy=False, **kwargs):
+            import mlx.nn as _nn
+            result = _vu2._load_safetensors(str(model_path))
+            captured.append(result)
+            class _M(_nn.Module):
+                pass
+            m = _M()
+            m.load_weights(list(result.items()), strict=False)
+            return m, None
+
+        monkeypatch.setattr(_vu2, "_load_safetensors", fake_load_st)
+        monkeypatch.setattr(_vu2, "load_model", fake_load_model)
+
+        with _remap_nested_visual_on_load(model_dir):
+            _vu2.load_model(str(model_dir))
+
+        assert len(captured) == 1
+        keys = list(captured[0].keys())
+        assert "language_model.model.layers.0.mlp.down_proj.scales" in keys
+        assert "embed_audio.embedding_projection.scales" in keys
+        # model.language_model.model.visual.* → language_model.model.visual.*
+        assert "language_model.model.visual.0.weight" in keys
+        assert not any(k.startswith("model.") for k in keys)
+
+    def test_non_gemma4_load_safetensors_not_patched(self, tmp_path, monkeypatch):
+        """For non-gemma4_unified models, _vu._load_safetensors is not wrapped."""
+        import mlx_vlm.utils as _vu2
+
+        model_dir = self._make_model_dir(tmp_path, "gemma4")
+        outside_ref = _vu2._load_safetensors
+        captured_ref: list = []
+
+        def fake_load_model(model_path, lazy=False, **kwargs):
+            import mlx.nn as _nn
+            captured_ref.append(_vu2._load_safetensors)
+            class _M(_nn.Module):
+                pass
+            return _M(), None
+
+        monkeypatch.setattr(_vu2, "load_model", fake_load_model)
+
+        with _remap_nested_visual_on_load(model_dir):
+            _vu2.load_model(str(model_dir))
+
+        assert len(captured_ref) == 1
+        assert captured_ref[0] is outside_ref
+
+    def test_load_safetensors_restored_on_context_exit(self, tmp_path):
+        """_vu._load_safetensors is patched inside the context and restored on exit."""
+        import mlx_vlm.utils as _vu2
+
+        model_dir = self._make_model_dir(tmp_path, "gemma4_unified")
+        original_load_st = _vu2._load_safetensors
+
+        with _remap_nested_visual_on_load(model_dir):
+            inside_ref = _vu2._load_safetensors
+
+        assert _vu2._load_safetensors is original_load_st
+        assert inside_ref is not original_load_st
+
+    def test_load_safetensors_restored_on_exception(self, tmp_path):
+        """_vu._load_safetensors is restored even when the with block raises."""
+        import mlx_vlm.utils as _vu2
+
+        model_dir = self._make_model_dir(tmp_path, "gemma4_unified")
+        original_load_st = _vu2._load_safetensors
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with _remap_nested_visual_on_load(model_dir):
+                raise RuntimeError("boom")
+
+        assert _vu2._load_safetensors is original_load_st

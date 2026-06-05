@@ -400,7 +400,7 @@ def _has_audio_weights(model_dir: Path) -> bool:
         try:
             with safetensors.safe_open(str(sf), framework="np") as f:
                 for k in f.keys():
-                    if k.startswith(("audio_tower.", "embed_audio.")):
+                    if k.startswith(("audio_tower.", "embed_audio.", "model.audio_tower.", "model.embed_audio.")):
                         return True
         except Exception:
             # Corrupt or unreadable shard — treat as no audio info, let
@@ -433,6 +433,24 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         cfg = original(path, **kwargs)
 
         from ..utils.model_loading import expand_per_layer_quant_keys
+
+        # For gemma4_unified: per-layer quantization dict keys are stored in
+        # HF format (model.language_model.*) in oQ4 checkpoints, but
+        # nn.quantize's class_predicate receives model-tree paths
+        # (language_model.model.*). Remap before expand_per_layer_quant_keys
+        # so the canonical paths are present for the predicate to match.
+        if cfg.get("model_type") == "gemma4_unified":
+            for _qk in ("quantization", "quantization_config"):
+                _quant = cfg.get(_qk)
+                if isinstance(_quant, dict):
+                    cfg[_qk] = {
+                        (
+                            _apply_gemma4_unified_key_remap(k)
+                            if isinstance(v, dict)
+                            else k
+                        ): v
+                        for k, v in _quant.items()
+                    }
 
         expand_per_layer_quant_keys(cfg)
 
@@ -474,22 +492,70 @@ _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
 
 
+def _apply_gemma4_unified_key_remap(k: str) -> str:
+    """Apply gemma4_unified sanitize transforms to a single weight key.
+
+    MLX-format gemma4_unified checkpoints store keys in HF format (with an
+    outer ``model.`` wrapper). This reproduces what ``Model.sanitize`` does
+    for non-MLX checkpoints, so the transforms fire even when sanitize is
+    skipped.
+    """
+    if not k.startswith("model."):
+        return k
+    k = k[len("model."):]
+    if k.startswith("language_model.") and not k.startswith("language_model.model."):
+        k = "language_model.model." + k[len("language_model."):]
+    return k
+
+
 @contextlib.contextmanager
 def _remap_nested_visual_on_load(model_dir: Path):
-    """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
-    ``load_model`` for MLX-format models where sanitize is skipped.
+    """Remap weight keys during ``load_model`` for MLX-format models where
+    sanitize is skipped.
 
     mlx-vlm's ``load_model`` skips ``Model.sanitize`` when the safetensors
     metadata declares ``format=mlx``. oQ output is MLX-format, so the
-    nested-visual key fixup that sanitize normally applies never fires.
+    key fixups that sanitize normally applies never fire.
     This context manager wraps ``load_model`` to intercept the weight dict
-    and perform the remap before ``nn.Module.load_weights`` is called.
+    and perform the remaps before ``nn.Module.load_weights`` is called.
+
+    Two remaps are applied:
+    - ``language_model.model.visual.*`` → ``vision_tower.*`` (all VLM models)
+    - ``model.X`` → sanitize-equivalent key (``gemma4_unified`` only): strips
+      the outer ``model.`` prefix and inserts ``model.`` inside language_model
+      sub-paths (``language_model.X`` → ``language_model.model.X``).
 
     Scoped to a single ``vlm_load(...)`` call.
     """
     import mlx_vlm.utils as _vu
 
+    # Detect gemma4_unified so we can apply its sanitize transforms for
+    # MLX-format checkpoints where sanitize is skipped.
+    _is_gemma4_unified = False
+    try:
+        with open(model_dir / "config.json") as _f:
+            _is_gemma4_unified = json.load(_f).get("model_type") == "gemma4_unified"
+    except Exception:
+        pass
+
     original_load_model = _vu.load_model
+
+    # For gemma4_unified: pre-remap safetensors weight keys at load time so
+    # nn.quantize's class_predicate (``f"{p}.scales" in weights``) can match
+    # model-tree paths (language_model.model.*) against the weights dict.
+    # MLX format skips sanitize, so raw HF-format keys (model.language_model.*)
+    # would otherwise cause every layer to appear unquantized to the predicate.
+    _original_load_st = None
+    if _is_gemma4_unified:
+        _original_load_st = _vu._load_safetensors
+
+        def _remapped_load_st(path: str) -> dict:
+            return {
+                _apply_gemma4_unified_key_remap(k): v
+                for k, v in _original_load_st(path).items()
+            }
+
+        _vu._load_safetensors = _remapped_load_st
 
     def _patched_load_model(model_path, lazy=False, **kwargs):
         import mlx.nn as _nn
@@ -500,17 +566,27 @@ def _remap_nested_visual_on_load(model_dir: Path):
             if isinstance(weights_items, str):
                 return orig_load_weights(self, weights_items, *args, **kw)
             remapped = []
-            n = 0
+            n_vis = 0
+            n_unified = 0
             for k, v in weights_items:
                 if k.startswith(_NESTED_VIS_PREFIX):
                     k = _VISION_TOWER_PREFIX + k[len(_NESTED_VIS_PREFIX) :]
-                    n += 1
+                    n_vis += 1
+                elif _is_gemma4_unified and k.startswith("model."):
+                    k = _apply_gemma4_unified_key_remap(k)
+                    n_unified += 1
                 remapped.append((k, v))
-            if n:
+            if n_vis:
                 logger.info(
                     "remap_nested_visual_on_load: remapped %d keys "
                     "'language_model.model.visual.*' -> 'vision_tower.*'",
-                    n,
+                    n_vis,
+                )
+            if n_unified:
+                logger.info(
+                    "remap_nested_visual_on_load: remapped %d gemma4_unified "
+                    "keys from 'model.*' to sanitized paths",
+                    n_unified,
                 )
             return orig_load_weights(self, remapped, *args, **kw)
 
@@ -525,6 +601,8 @@ def _remap_nested_visual_on_load(model_dir: Path):
         yield
     finally:
         _vu.load_model = original_load_model
+        if _original_load_st is not None:
+            _vu._load_safetensors = _original_load_st
 
 
 # Models that only support a single image per request
