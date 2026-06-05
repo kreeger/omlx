@@ -575,3 +575,59 @@ class TestRemapNestedVisualOnLoad:
                 raise RuntimeError("boom")
 
         assert _vu2._load_safetensors is original_load_st
+
+
+class TestPatchVideoProcessorBug:
+    """_patch_video_processor_bug filters invalid kwargs from Gemma4UnifiedVideoProcessor."""
+
+    def test_invalid_kwargs_stripped_from_unified_video_processor(self):
+        """do_convert_rgb and other image-only kwargs from oQ4 processor_config.json
+        must not reach Gemma4VideoProcessor.__init__, which rejects them."""
+        from omlx.engine.vlm import _patch_video_processor_bug
+
+        _patch_video_processor_bug()
+
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        # These are the fields present in oQ4 checkpoint processor_config.json
+        # that Gemma4VideoProcessor.__init__ does not accept.
+        vp = Gemma4UnifiedVideoProcessor(
+            patch_size=16,
+            max_soft_tokens=70,
+            pooling_kernel_size=3,
+            num_frames=32,
+            do_rescale=True,
+            rescale_factor=1 / 255,
+            do_normalize=True,
+            image_mean=[0.0, 0.0, 0.0],
+            image_std=[1.0, 1.0, 1.0],
+            # Invalid args that should be silently dropped:
+            do_convert_rgb=True,
+            do_resize=True,
+            do_sample_frames=True,
+            resample=3,
+            return_metadata=False,
+        )
+        assert vp.patch_size == 16
+        assert vp.num_frames == 32
+
+    def test_valid_kwargs_still_applied(self):
+        """Valid kwargs are not accidentally stripped."""
+        from omlx.engine.vlm import _patch_video_processor_bug
+
+        _patch_video_processor_bug()
+
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        vp = Gemma4UnifiedVideoProcessor(
+            patch_size=32,
+            num_frames=16,
+            do_normalize=False,
+        )
+        assert vp.patch_size == 32
+        assert vp.num_frames == 16
+        assert vp.do_normalize is False

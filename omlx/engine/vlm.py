@@ -144,6 +144,30 @@ def _patch_video_processor_bug():
     except (ImportError, AttributeError):
         pass
 
+    try:
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        _orig_unified_vp_init = Gemma4UnifiedVideoProcessor.__init__
+        # Gemma4VideoProcessor.__init__ only accepts this specific set of kwargs.
+        # MLX-format oQ4 checkpoints store additional image-only fields in the
+        # video_processor section of processor_config.json that cause a TypeError.
+        _VALID_VP_KWARGS = frozenset({
+            "patch_size", "max_soft_tokens", "pooling_kernel_size", "num_frames",
+            "do_rescale", "rescale_factor", "do_normalize", "image_mean",
+            "image_std", "default_fps",
+        })
+
+        def _unified_vp_init_filtered(self, **kwargs):
+            return _orig_unified_vp_init(
+                self, **{k: v for k, v in kwargs.items() if k in _VALID_VP_KWARGS}
+            )
+
+        Gemma4UnifiedVideoProcessor.__init__ = _unified_vp_init_filtered
+    except (ImportError, AttributeError):
+        pass
+
     _video_processor_patched = True
 
 
