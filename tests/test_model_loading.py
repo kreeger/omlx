@@ -434,3 +434,73 @@ class TestCheckpointHasMtpWeights:
         )
 
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+
+
+class TestDflashGemma4UnifiedPatch:
+    """install_dflash_lifecycle_wrap must extend _GEMMA4_MODEL_TYPES to include
+    gemma4_unified so DFlash speculative decoding uses the correct layer pattern."""
+
+    def test_gemma4_unified_in_model_types_after_patch(self, monkeypatch):
+        import dflash_mlx.model as _dflash_model
+        from omlx.patches.dflash_lifecycle import install_dflash_lifecycle_wrap
+
+        # Reset to original state so the patch runs fresh
+        monkeypatch.setattr(
+            _dflash_model,
+            "_GEMMA4_MODEL_TYPES",
+            frozenset(("gemma4", "gemma4_text")),
+        )
+        install_dflash_lifecycle_wrap()
+        assert "gemma4_unified" in _dflash_model._GEMMA4_MODEL_TYPES
+
+    def test_is_gemma4_model_type_true_for_gemma4_unified_after_patch(self, monkeypatch):
+        import dflash_mlx.model as _dflash_model
+        from omlx.patches.dflash_lifecycle import install_dflash_lifecycle_wrap
+
+        monkeypatch.setattr(
+            _dflash_model,
+            "_GEMMA4_MODEL_TYPES",
+            frozenset(("gemma4", "gemma4_text")),
+        )
+        install_dflash_lifecycle_wrap()
+        assert _dflash_model._is_gemma4_model_type("gemma4_unified")
+
+    def test_patch_is_idempotent(self, monkeypatch):
+        import dflash_mlx.model as _dflash_model
+        from omlx.patches.dflash_lifecycle import install_dflash_lifecycle_wrap
+
+        monkeypatch.setattr(
+            _dflash_model,
+            "_GEMMA4_MODEL_TYPES",
+            frozenset(("gemma4", "gemma4_text")),
+        )
+        install_dflash_lifecycle_wrap()
+        install_dflash_lifecycle_wrap()
+        # Called twice — should still have exactly one gemma4_unified entry
+        assert "gemma4_unified" in _dflash_model._GEMMA4_MODEL_TYPES
+        # frozenset has no duplicates by definition, but verify the set size is right
+        assert len(_dflash_model._GEMMA4_MODEL_TYPES) == 3
+
+
+class TestGemma4UnifiedOmlxRouting:
+    """Verify oMLX's own code correctly handles gemma4_unified."""
+
+    def test_gemma4_unified_in_vlm_model_types(self):
+        from omlx.model_discovery import VLM_MODEL_TYPES
+        assert "gemma4_unified" in VLM_MODEL_TYPES
+
+    def test_is_gemma4_model_returns_true_for_gemma4_unified(self):
+        from omlx.utils.tokenizer import is_gemma4_model
+        assert is_gemma4_model("any-model-name", {"model_type": "gemma4_unified"})
+
+    def test_is_gemma4_model_returns_true_for_gemma4(self):
+        from omlx.utils.tokenizer import is_gemma4_model
+        assert is_gemma4_model("any-model-name", {"model_type": "gemma4"})
+
+    def test_pre_load_patches_noop_for_gemma4_unified(self, tmp_path):
+        """maybe_apply_pre_load_patches must not raise for gemma4_unified.
+        No pre-load patch dispatches for this model type."""
+        config = '{"model_type": "gemma4_unified", "vision_config": {}}'
+        path = _write_config(tmp_path, config)
+        result = maybe_apply_pre_load_patches(path, model_settings=None)
+        assert result is None
