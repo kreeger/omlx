@@ -105,6 +105,18 @@ def install_dflash_lifecycle_wrap() -> bool:
             "_dflash_full_attention_gqa_installed",
         )
 
+    try:
+        import dflash_mlx.model as _dflash_model
+        if "gemma4_unified" not in getattr(_dflash_model, "_GEMMA4_MODEL_TYPES", ()):
+            _dflash_model._GEMMA4_MODEL_TYPES = (
+                _dflash_model._GEMMA4_MODEL_TYPES | frozenset(("gemma4_unified",))
+            )
+            logger.debug(
+                "dflash _GEMMA4_MODEL_TYPES patched to include gemma4_unified"
+            )
+    except (ImportError, AttributeError):
+        pass
+
     if wrapped_any:
         logger.debug("dflash lifecycle wrap installed")
     return wrapped_any
