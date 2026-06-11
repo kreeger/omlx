@@ -62,6 +62,7 @@ VLM_MODEL_TYPES = {
     "phi4_siglip",
     "phi4mm",
     "youtu_vl",
+    "diffusion_gemma",
 }
 
 # Known VLM architectures
@@ -82,6 +83,7 @@ VLM_ARCHITECTURES = {
     "Molmo2ForConditionalGeneration",
     "LlavaQwen2ForCausalLM",  # apple/FastVLM (all sizes)
     "Florence2ForConditionalGeneration",
+    "DiffusionGemmaForBlockDiffusion",
 }
 
 # Known embedding model types from mlx-embeddings
@@ -577,9 +579,10 @@ def detect_model_type(model_path: Path) -> ModelType:
     # exception: it is always VLM (unified audio+vision architecture) regardless
     # of vision_config presence in config.json.
     if normalized_type in VLM_MODEL_TYPES:
-        if normalized_type == "gemma4_unified":
+        if normalized_type in ("gemma4_unified", "diffusion_gemma"):
             logger.info(
-                "gemma4_unified detected as VLM (unified models always include vision)"
+                "%s detected as VLM (always multimodal architecture)",
+                model_type,
             )
             return "vlm"
         if _has_vision_subconfig(config):

@@ -470,6 +470,82 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         _vu.load_config = original
 
 
+_DIFFUSION_GEMMA_VISION_WEIGHT_PREFIXES = (
+    "model.encoder.vision_tower.",
+    "model.encoder.embed_vision.",
+)
+
+
+def _has_diffusion_gemma_vision_weights(model_dir: Path) -> bool:
+    """Return True iff any safetensors shard contains diffusion_gemma vision keys."""
+    import safetensors
+
+    for sf in model_dir.glob("*.safetensors"):
+        try:
+            with safetensors.safe_open(str(sf), framework="np") as f:
+                for k in f.keys():
+                    if k.startswith(_DIFFUSION_GEMMA_VISION_WEIGHT_PREFIXES):
+                        return True
+        except Exception:
+            return False
+    return False
+
+
+@contextlib.contextmanager
+def _strip_diffusion_gemma_vision_config_if_orphaned(model_dir: Path):
+    """Drop `vision_config` from `mlx_vlm.utils.load_config` results for
+    diffusion_gemma checkpoints that lack vision tower weights.
+
+    oQ-quantized diffusion_gemma checkpoints may preserve `vision_config` in
+    `config.json` but omit the vision tower weights from the safetensors.
+    mlx-vlm then instantiates `VisionEncoder` based on `vision_config` and
+    `load_weights(strict=True)` fails with missing parameters.
+
+    Only acts when model_type == "diffusion_gemma" and no
+    model.encoder.vision_tower.* / model.encoder.embed_vision.* weights are
+    found; all other models are passed through unchanged.
+    """
+    import mlx_vlm.utils as _vu
+
+    original = _vu.load_config
+    warned = set()
+
+    def _patched(path, **kwargs):
+        cfg = original(path, **kwargs)
+
+        if cfg.get("model_type") != "diffusion_gemma":
+            return cfg
+        if cfg.get("vision_config") is None:
+            return cfg
+        try:
+            p = Path(path) if not isinstance(path, Path) else path
+            if not p.is_dir():
+                return cfg
+            if _has_diffusion_gemma_vision_weights(p):
+                return cfg
+        except Exception:
+            return cfg
+        cfg = dict(cfg)
+        # Explicit None instead of pop: mlx-vlm's load_model runs
+        # `config.setdefault("vision_config", {})` which would otherwise
+        # repopulate vision_config with `{}` and instantiate VisionEncoder
+        # with default values.
+        cfg["vision_config"] = None
+        if str(p) not in warned:
+            warned.add(str(p))
+            logger.warning(
+                "vision_tower weights missing for %s; loading without vision support",
+                p.name,
+            )
+        return cfg
+
+    _vu.load_config = _patched
+    try:
+        yield
+    finally:
+        _vu.load_config = original
+
+
 _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
 
@@ -682,6 +758,7 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
+        self._is_diffusion: bool = False
 
     @property
     def model_name(self) -> str:
@@ -823,6 +900,9 @@ class VLMBatchedEngine(BaseEngine):
             _patch_torch_free_image_processor()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
+                _strip_diffusion_gemma_vision_config_if_orphaned(
+                    Path(self._model_name)
+                ),
                 _remap_nested_visual_on_load(Path(self._model_name)),
             ):
                 custom_loaded = maybe_load_custom_quantization(
@@ -884,6 +964,36 @@ class VLMBatchedEngine(BaseEngine):
         # mlx-vlm models now handle per-sequence mx.array offsets natively
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
+
+        # Detect block-diffusion models (e.g. DiffusionGemma). These bypass the
+        # scheduler entirely and use mlx_vlm's own generation loop.
+        try:
+            from mlx_vlm.generate.diffusion import is_diffusion_model as _is_dm
+
+            self._is_diffusion = _is_dm(self._vlm_model)
+        except Exception:
+            logger.exception(
+                "is_diffusion_model check raised; falling back to model_type check"
+            )
+            self._is_diffusion = False
+        # Belt-and-suspenders: mlx_vlm checks canvas_length; also accept the
+        # model_type string directly so a silently-returning-False case is caught.
+        if not self._is_diffusion:
+            _cfg = getattr(self._vlm_model, "config", None)
+            _mt = getattr(_cfg, "model_type", "")
+            _cl = getattr(_cfg, "canvas_length", None)
+            if _mt == "diffusion_gemma" or _cl is not None:
+                logger.warning(
+                    "is_diffusion_model returned False but model_type=%r "
+                    "canvas_length=%r — forcing diffusion path",
+                    _mt,
+                    _cl,
+                )
+                self._is_diffusion = True
+        if self._is_diffusion:
+            logger.info(
+                "Block-diffusion model detected; scheduler bypassed for generation"
+            )
 
         # Create scheduler config
         scheduler_config = (
@@ -1039,6 +1149,7 @@ class VLMBatchedEngine(BaseEngine):
         self._adapter = None
         self._tokenizer = None
         self._vlm_mtp_drafter = None
+        self._is_diffusion = False
         self._loaded = False
         logger.info("VLMBatchedEngine stopped")
 
@@ -1981,6 +2092,99 @@ class VLMBatchedEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
 
+    def _prompt_to_str(self, prompt: str | list[int]) -> str:
+        if isinstance(prompt, list):
+            return self._tokenizer.decode(prompt)
+        return prompt
+
+    async def _iter_diffusion_results(
+        self,
+        prompt_str: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ):
+        """Async generator: bridges mlx_vlm's sync diffusion generator to async.
+
+        stream_diffusion_generate yields one GenerationResult per unmasked
+        token segment, plus empty draft/block-end markers. Items are pushed
+        onto an asyncio.Queue from the MLX executor thread and consumed here.
+        """
+        import asyncio
+
+        from mlx_vlm.generate import stream_generate as vlm_stream_generate
+
+        loop = asyncio.get_running_loop()
+        model = self._vlm_model
+        processor = self._processor
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def _sync() -> None:
+            try:
+                for result in vlm_stream_generate(
+                    model,
+                    processor,
+                    prompt_str,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, result)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        fut = loop.run_in_executor(self._engine._mlx_executor, _sync)
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            await fut
+
+    async def _run_diffusion_generate(
+        self,
+        prompt: str | list[int],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        **kwargs,
+    ) -> "GenerationOutput":
+        """Non-streaming diffusion pass — drains the generator and accumulates."""
+        prompt_str = self._prompt_to_str(prompt)
+        accumulated = ""
+        last = None
+        async for result in self._iter_diffusion_results(
+            prompt_str, max_tokens, temperature, top_p, top_k
+        ):
+            if result.text:
+                accumulated += result.text
+            last = result
+
+        if last is None:
+            return GenerationOutput(
+                text="",
+                prompt_tokens=0,
+                completion_tokens=0,
+                finish_reason="length",
+            )
+
+        return GenerationOutput(
+            text=clean_special_tokens(accumulated),
+            prompt_tokens=last.prompt_tokens,
+            completion_tokens=last.generation_tokens,
+            finish_reason=last.finish_reason or "stop",
+            cached_tokens=getattr(last, "cached_tokens", 0) or 0,
+        )
+
     async def generate(
         self,
         prompt: str | list[int],
@@ -2002,6 +2206,11 @@ class VLMBatchedEngine(BaseEngine):
         """Generate a complete response (non-streaming)."""
         if not self._loaded:
             await self.start()
+
+        if self._is_diffusion:
+            return await self._run_diffusion_generate(
+                prompt, max_tokens, temperature, top_p, top_k, **kwargs
+            )
 
         # OCR models: add extra stop token IDs to prevent degeneration.
         # Sampling params (temperature, repetition_penalty, max_tokens) are
@@ -2072,6 +2281,27 @@ class VLMBatchedEngine(BaseEngine):
         """Stream generation token by token."""
         if not self._loaded:
             await self.start()
+
+        if self._is_diffusion:
+            prompt_str = self._prompt_to_str(prompt)
+            accumulated = ""
+            async for result in self._iter_diffusion_results(
+                prompt_str, max_tokens, temperature, top_p, top_k
+            ):
+                if not result.text:
+                    continue  # skip empty draft/block-end markers
+                accumulated += result.text
+                is_final = result.finish_reason is not None
+                yield GenerationOutput(
+                    text=clean_special_tokens(accumulated),
+                    new_text=clean_special_tokens(result.text),
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.generation_tokens,
+                    finished=is_final,
+                    finish_reason=result.finish_reason if is_final else None,
+                    cached_tokens=getattr(result, "cached_tokens", 0) or 0,
+                )
+            return
 
         # OCR models: add extra stop token IDs to prevent degeneration.
         # Sampling params (temperature, repetition_penalty, max_tokens) are
